@@ -1,0 +1,42 @@
+{
+  "1": [
+    {
+      "sender_id": 2,
+      "text": "123]",
+      "timestamp": "10:14",
+      "status": "sent",
+      "message_id": 1,
+      "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 1,
+      "text": "hi",
+      "timestamp": "10:14",
+      "status": "delivered",
+      "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 1,
+      "text": "test1",
+      "timestamp": "10:14",
+      "status": "delivered",
+      "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 2,
+      "text": "test2",
+      "timestamp": "10:14",
+      "status": "sent",
+      "message_id": 4,
+      "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 2,
+      "text": "12345",
+      "timestamp": "10:14",
+      "status": "sent",
+      "message_id": 5,
+      "self_destruct_seconds": null
+    }
+  ]
+}
