@@ -36,6 +36,20 @@
       "timestamp": "10:14",
       "status": "delivered",
       "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 2,
+      "text": "Yo",
+      "timestamp": "13:46",
+      "status": "delivered",
+      "self_destruct_seconds": null
+    },
+    {
+      "sender_id": 2,
+      "text": "??",
+      "timestamp": "13:47",
+      "status": "delivered",
+      "self_destruct_seconds": null
     }
   ]
 }
