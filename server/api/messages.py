@@ -8,11 +8,16 @@ ONLINE_TIMEOUT = timedelta(seconds=10)
 messages_bp = Blueprint('messages', __name__)
 
 
+MAX_MESSAGE_SIZE = 64 * 1024
+
+
 @messages_bp.route('/send', methods=['POST'])
 @jwt_required()
 def send_message():
     user_id = int(get_jwt_identity())
     data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
 
     receiver_id = data.get('receiver_id')
     ciphertext = data.get('ciphertext')
@@ -23,6 +28,19 @@ def send_message():
 
     if not receiver_id or not ciphertext or not nonce:
         return jsonify({'error': 'Missing required fields'}), 400
+
+    if not isinstance(receiver_id, int) or receiver_id <= 0:
+        return jsonify({'error': 'Invalid receiver_id'}), 400
+
+    if len(ciphertext) > MAX_MESSAGE_SIZE:
+        return jsonify({'error': 'Message too large'}), 400
+
+    if message_type not in ('normal', 'initial'):
+        return jsonify({'error': 'Invalid message type'}), 400
+
+    if self_destruct_seconds is not None:
+        if not isinstance(self_destruct_seconds, int) or self_destruct_seconds < 1 or self_destruct_seconds > 604800:
+            return jsonify({'error': 'Invalid self_destruct_seconds (1-604800)'}), 400
 
     friendship = Friendship.query.filter_by(user_id=user_id, friend_id=receiver_id).first()
     if not friendship:
@@ -58,6 +76,17 @@ def fetch_messages():
         user.is_online = True
         user.last_seen = datetime.utcnow()
         db.session.commit()
+
+    now = datetime.utcnow()
+    expired = Message.query.filter(
+        Message.self_destruct_seconds.isnot(None),
+        Message.delivered_at.isnot(None),
+    ).all()
+    for msg in expired:
+        expire_time = msg.delivered_at + timedelta(seconds=msg.self_destruct_seconds)
+        if now > expire_time:
+            db.session.delete(msg)
+    db.session.commit()
 
     messages = Message.query.filter_by(receiver_id=user_id, status='sent').order_by(
         Message.created_at.asc()
@@ -192,3 +221,23 @@ def ack_messages():
     db.session.commit()
 
     return jsonify({'message': 'Acknowledged'}), 200
+
+
+@messages_bp.route('/sent_status', methods=['GET'])
+@jwt_required()
+def get_sent_status():
+    user_id = int(get_jwt_identity())
+
+    messages = Message.query.filter(
+        Message.sender_id == user_id,
+        Message.status.in_(['delivered', 'read']),
+    ).all()
+
+    result = []
+    for msg in messages:
+        result.append({
+            'message_id': msg.id,
+            'status': msg.status,
+        })
+
+    return jsonify({'statuses': result}), 200

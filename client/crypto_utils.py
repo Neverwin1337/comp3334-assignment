@@ -78,6 +78,13 @@ def verify_signature(signing_public_key_b64, signature_b64, signed_key_b64):
         return False
 
 
+def generate_fingerprint(identity_public_key_b64):
+    import hashlib
+    key_bytes = base64.b64decode(identity_public_key_b64.split(':')[-1])
+    digest = hashlib.sha256(key_bytes).hexdigest().upper()
+    return ' '.join([digest[i:i+4] for i in range(0, 32, 4)])
+
+
 def x25519_derive_shared(private_key, public_key):
     return private_key.exchange(public_key)
 
@@ -93,23 +100,27 @@ def kdf_derive(shared_secrets, info=b'SecureChat'):
     return hkdf.derive(ikm)
 
 
-def aes_encrypt(key, plaintext):
+def aes_encrypt(key, plaintext, associated_data=None):
     aesgcm = AESGCM(key)
     nonce = os.urandom(12)
     if isinstance(plaintext, str):
         plaintext = plaintext.encode('utf-8')
-    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    if associated_data and isinstance(associated_data, str):
+        associated_data = associated_data.encode('utf-8')
+    ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data)
     return (
         base64.b64encode(ciphertext).decode('utf-8'),
         base64.b64encode(nonce).decode('utf-8'),
     )
 
 
-def aes_decrypt(key, ciphertext_b64, nonce_b64):
+def aes_decrypt(key, ciphertext_b64, nonce_b64, associated_data=None):
     aesgcm = AESGCM(key)
     ciphertext = base64.b64decode(ciphertext_b64)
     nonce = base64.b64decode(nonce_b64)
-    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+    if associated_data and isinstance(associated_data, str):
+        associated_data = associated_data.encode('utf-8')
+    plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data)
     return plaintext.decode('utf-8')
 
 
@@ -175,8 +186,8 @@ class KeyBundle:
             'one_time_prekeys': otpks,
         }
 
-    def save_to_file(self, filepath):
-        data = {
+    def _get_key_data(self):
+        return {
             'identity_private_key': priv_to_b64(self.identity_private_key),
             'identity_public_key': pub_to_b64(self.identity_public_key),
             'signing_private_key': priv_to_b64(self.signing_private_key),
@@ -193,12 +204,40 @@ class KeyBundle:
                 for otpk in self.one_time_prekeys
             ],
         }
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
 
-    def load_from_file(self, filepath):
+    def save_to_file(self, filepath, passphrase=None):
+        data = self._get_key_data()
+        if passphrase:
+            plaintext = json.dumps(data)
+            ciphertext_b64, nonce_b64, salt_b64 = encrypt_backup(plaintext, passphrase)
+            encrypted_data = {
+                'encrypted': True,
+                'ciphertext': ciphertext_b64,
+                'nonce': nonce_b64,
+                'salt': salt_b64,
+            }
+            with open(filepath, 'w') as f:
+                json.dump(encrypted_data, f, indent=2)
+        else:
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2)
+
+    def load_from_file(self, filepath, passphrase=None):
         with open(filepath, 'r') as f:
-            data = json.load(f)
+            file_data = json.load(f)
+
+        if file_data.get('encrypted'):
+            if not passphrase:
+                raise ValueError('Passphrase required for encrypted key file')
+            plaintext = decrypt_backup(
+                file_data['ciphertext'],
+                file_data['nonce'],
+                file_data['salt'],
+                passphrase
+            )
+            data = json.loads(plaintext)
+        else:
+            data = file_data
 
         self.identity_private_key = b64_to_x25519_priv(data['identity_private_key'])
         self.identity_public_key = self.identity_private_key.public_key()
@@ -273,12 +312,12 @@ class SessionCipher:
 
         self.shared_key = kdf_derive(shared_secrets)
 
-    def encrypt(self, plaintext):
+    def encrypt(self, plaintext, associated_data=None):
         if not self.shared_key:
             raise ValueError('Session not initialized')
-        return aes_encrypt(self.shared_key, plaintext)
+        return aes_encrypt(self.shared_key, plaintext, associated_data)
 
-    def decrypt(self, ciphertext_b64, nonce_b64):
+    def decrypt(self, ciphertext_b64, nonce_b64, associated_data=None):
         if not self.shared_key:
             raise ValueError('Session not initialized')
-        return aes_decrypt(self.shared_key, ciphertext_b64, nonce_b64)
+        return aes_decrypt(self.shared_key, ciphertext_b64, nonce_b64, associated_data)

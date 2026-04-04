@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import time
+import argparse
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -14,9 +15,9 @@ from PySide6.QtCore import Qt, QTimer, QThread, QSize
 from PySide6.QtGui import QFont, QColor
 
 from api_client import ApiClient
-from crypto_utils import KeyBundle, SessionCipher, encrypt_backup, decrypt_backup
+from crypto_utils import KeyBundle, SessionCipher, encrypt_backup, decrypt_backup, generate_fingerprint
 from styles import STYLE_SHEET
-from storage import SessionManager, MessageStore, DATA_DIR
+from storage import SessionManager, MessageStore, ContactKeyStore, DATA_DIR
 from workers import PollingWorker
 from widgets import LoginWindow, ChatWidget
 
@@ -33,6 +34,7 @@ class MainWindow(QMainWindow):
         self.key_bundle = KeyBundle()
         self.session_mgr = SessionManager(self.username)
         self.message_store = MessageStore(self.username)
+        self.contact_keys = ContactKeyStore(self.username)
         self.chat_widgets = {}
 
         self._init_keys()
@@ -267,6 +269,8 @@ class MainWindow(QMainWindow):
 
         self.friends_list = QListWidget()
         self.friends_list.itemClicked.connect(self._on_friend_clicked)
+        self.friends_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.friends_list.customContextMenuRequested.connect(self._on_friend_context_menu)
         contacts_layout.addWidget(self.friends_list)
         self.tabs.addTab(contacts_tab, 'Contacts')
 
@@ -313,20 +317,28 @@ class MainWindow(QMainWindow):
         self.poll_worker.new_friend_requests.connect(self._on_new_friend_requests)
         self.poll_worker.friends_updated.connect(self._on_friends_updated)
         self.poll_worker.conversations_updated.connect(self._on_conversations_updated)
+        self.poll_worker.sent_status_updated.connect(self._on_sent_status_updated)
         self.poll_thread.started.connect(self.poll_worker.poll)
         self.poll_thread.start()
 
     def _on_new_messages(self, messages):
         ack_ids = []
         for msg in messages:
+            msg_id = msg['message_id']
+            if self.message_store.is_duplicate(msg_id):
+                ack_ids.append(msg_id)
+                continue
+
             sender_id = msg['sender_id']
             try:
                 plaintext = self._decrypt_message(msg)
                 ts = datetime.fromisoformat(msg['created_at']).strftime('%H:%M')
                 sd = msg.get('self_destruct_seconds')
 
+                self.message_store.mark_seen(msg_id)
+
                 if sender_id in self.chat_widgets:
-                    self.chat_widgets[sender_id].receive_message(plaintext, ts, sd)
+                    self.chat_widgets[sender_id].receive_message(plaintext, ts, sd, msg_id)
                 else:
                     now = time.time()
                     msg_data = {
@@ -334,16 +346,17 @@ class MainWindow(QMainWindow):
                         'text': plaintext,
                         'timestamp': ts,
                         'status': 'delivered',
+                        'message_id': msg_id,
                         'self_destruct_seconds': sd,
                     }
                     if sd:
                         msg_data['expire_at'] = now + sd
                     self.message_store.add_message(sender_id, msg_data)
 
-                ack_ids.append(msg['message_id'])
+                ack_ids.append(msg_id)
             except Exception as e:
                 import traceback
-                print(f'Decrypt error for message {msg["message_id"]}: {e}')
+                print(f'Decrypt error for message {msg_id}: {e}')
                 traceback.print_exc()
 
         if ack_ids:
@@ -357,6 +370,12 @@ class MainWindow(QMainWindow):
     def _decrypt_message(self, msg):
         sender_id = msg['sender_id']
 
+        ad = json.dumps({
+            'sender_id': int(sender_id),
+            'receiver_id': int(self.user_id),
+            'ttl': msg.get('self_destruct_seconds'),
+        }, sort_keys=True)
+
         if msg['message_type'] == 'initial' and msg.get('ephemeral_key'):
             info = json.loads(msg['ephemeral_key'])
             cipher = SessionCipher()
@@ -368,12 +387,26 @@ class MainWindow(QMainWindow):
             )
             shared_key_b64 = base64.b64encode(cipher.shared_key).decode('utf-8')
             self.session_mgr.save_session(sender_id, shared_key_b64)
-            return cipher.decrypt(msg['ciphertext'], msg['nonce'])
+            sender_ik = info['sender_ik']
+            if ':' in sender_ik:
+                sender_ik = sender_ik.split(':')[1]
+            self.contact_keys.save_contact_key(sender_id, sender_ik)
+            return cipher.decrypt(msg['ciphertext'], msg['nonce'], ad)
         else:
             cipher = self.session_mgr.get_session(sender_id)
             if not cipher:
                 raise Exception('No session found for this sender')
-            return cipher.decrypt(msg['ciphertext'], msg['nonce'])
+            if not self.contact_keys.get_contact(sender_id):
+                try:
+                    bundle_data, status = self.api.get_key_bundle(sender_id)
+                    if status == 200:
+                        ik = bundle_data['identity_public_key']
+                        if ':' in ik:
+                            ik = ik.split(':')[1]
+                        self.contact_keys.save_contact_key(sender_id, ik)
+                except Exception:
+                    pass
+            return cipher.decrypt(msg['ciphertext'], msg['nonce'], ad)
 
     def _on_new_friend_requests(self, requests):
         self._update_requests_list(requests)
@@ -400,6 +433,21 @@ class MainWindow(QMainWindow):
                 item.setForeground(QColor('#e94560'))
                 item.setFont(QFont('Segoe UI', 12, QFont.Bold))
             self.conversation_list.addItem(item)
+
+    def _on_sent_status_updated(self, statuses):
+        changed_friends = set()
+        for s in statuses:
+            mid = s['message_id']
+            new_status = s['status']
+            for friend_id, msgs in self.message_store.messages.items():
+                for msg in msgs:
+                    if msg.get('message_id') == mid and msg.get('status') != new_status:
+                        self.message_store.update_message_status(mid, new_status)
+                        changed_friends.add(int(friend_id))
+                        break
+        for fid in changed_friends:
+            if fid in self.chat_widgets:
+                self.chat_widgets[fid].refresh_messages()
 
     def _refresh_friends(self):
         try:
@@ -485,6 +533,60 @@ class MainWindow(QMainWindow):
         friend = item.data(Qt.UserRole)
         self._open_chat(friend['user_id'], friend['username'])
 
+    def _on_friend_context_menu(self, pos):
+        from PySide6.QtWidgets import QMenu
+        item = self.friends_list.itemAt(pos)
+        if not item:
+            return
+        friend = item.data(Qt.UserRole)
+        if not friend:
+            return
+
+        menu = QMenu(self)
+        remove_action = menu.addAction('Remove Friend')
+        block_action = menu.addAction('Block User')
+
+        action = menu.exec(self.friends_list.mapToGlobal(pos))
+        if action == remove_action:
+            self._remove_friend(friend['user_id'], friend['username'])
+        elif action == block_action:
+            self._block_user(friend['user_id'], friend['username'])
+
+    def _remove_friend(self, friend_id, username):
+        reply = QMessageBox.question(
+            self, 'Remove Friend',
+            f'Remove {username} from friends?',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                data, status = self.api.remove_friend(friend_id)
+                if status == 200:
+                    self._refresh_friends()
+                    self._refresh_conversations()
+                else:
+                    QMessageBox.warning(self, 'Error', data.get('error', 'Failed'))
+            except Exception as e:
+                QMessageBox.warning(self, 'Error', str(e))
+
+    def _block_user(self, user_id, username):
+        reply = QMessageBox.question(
+            self, 'Block User',
+            f'Block {username}? This will also remove them from friends.',
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            try:
+                data, status = self.api.block_user(user_id)
+                if status == 200:
+                    self._refresh_friends()
+                    self._refresh_conversations()
+                    QMessageBox.information(self, 'Blocked', f'{username} has been blocked.')
+                else:
+                    QMessageBox.warning(self, 'Error', data.get('error', 'Failed'))
+            except Exception as e:
+                QMessageBox.warning(self, 'Error', str(e))
+
     def _on_conversation_clicked(self, item):
         conv = item.data(Qt.UserRole)
         self._open_chat(conv['friend_id'], conv['friend_username'])
@@ -494,6 +596,7 @@ class MainWindow(QMainWindow):
             chat = ChatWidget(
                 self.api, self.user_id, friend_id, friend_name,
                 self.session_mgr, self.message_store, self.key_bundle,
+                self.contact_keys,
             )
             self.chat_widgets[friend_id] = chat
             self.chat_stack.addWidget(chat)
@@ -501,7 +604,14 @@ class MainWindow(QMainWindow):
         self.chat_stack.setCurrentWidget(self.chat_widgets[friend_id])
 
     def _check_expired_messages(self):
+        old_counts = {k: len(v) for k, v in self.message_store.messages.items()}
         self.message_store.remove_expired()
+        for friend_id, old_count in old_counts.items():
+            new_count = len(self.message_store.messages.get(friend_id, []))
+            if new_count < old_count:
+                fid = int(friend_id)
+                if fid in self.chat_widgets:
+                    self.chat_widgets[fid].refresh_messages()
 
     def _on_logout(self):
         self.poll_worker.stop()
@@ -525,13 +635,13 @@ class MainWindow(QMainWindow):
 
 
 class App(QMainWindow):
-    def __init__(self):
+    def __init__(self, skip_otp=False):
         super().__init__()
         self.setWindowTitle('SecureChat')
         self.setMinimumSize(500, 600)
         self.api = ApiClient()
 
-        self.login_window = LoginWindow(self.api)
+        self.login_window = LoginWindow(self.api, skip_otp=skip_otp)
         self.login_window.login_success.connect(self._on_login_success)
         self.setCentralWidget(self.login_window)
 
@@ -542,9 +652,16 @@ class App(QMainWindow):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--skip-otp', action='store_true', help='Skip OTP verification for login')
+    args = parser.parse_args()
+
+    if args.skip_otp:
+        print('[WARNING] OTP verification is DISABLED')
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLE_SHEET)
-    window = App()
+    window = App(skip_otp=args.skip_otp)
     window.show()
     sys.exit(app.exec())
 

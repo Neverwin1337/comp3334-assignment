@@ -7,6 +7,7 @@ class PollingWorker(QObject):
     new_friend_requests = Signal(list)
     friends_updated = Signal(list)
     conversations_updated = Signal(list)
+    sent_status_updated = Signal(list)
 
     def __init__(self, api_client):
         super().__init__()
@@ -31,6 +32,10 @@ class PollingWorker(QObject):
                 data, status = self.api.get_conversations()
                 if status == 200:
                     self.conversations_updated.emit(data['conversations'])
+
+                data, status = self.api.get_sent_status()
+                if status == 200 and data.get('statuses'):
+                    self.sent_status_updated.emit(data['statuses'])
             except Exception:
                 pass
             time.sleep(1)

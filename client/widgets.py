@@ -16,9 +16,10 @@ from crypto_utils import SessionCipher
 class LoginWindow(QWidget):
     login_success = Signal(dict)
 
-    def __init__(self, api_client):
+    def __init__(self, api_client, skip_otp=False):
         super().__init__()
         self.api = api_client
+        self.skip_otp = skip_otp
         self._setup_ui()
 
     def _setup_ui(self):
@@ -57,6 +58,9 @@ class LoginWindow(QWidget):
         self.otp_input.setMinimumHeight(44)
         layout.addWidget(self.otp_input)
 
+        if self.skip_otp:
+            self.otp_input.hide()
+
         self.login_btn = QPushButton('Login')
         self.login_btn.setMinimumHeight(44)
         self.login_btn.clicked.connect(self._on_login)
@@ -78,8 +82,13 @@ class LoginWindow(QWidget):
         password = self.password_input.text()
         otp_code = self.otp_input.text().strip()
 
-        if not username or not password or not otp_code:
-            self.status_label.setText('All fields are required')
+        if not username or not password:
+            self.status_label.setText('Username and password required')
+            self.status_label.setStyleSheet('color: #e94560;')
+            return
+
+        if not self.skip_otp and not otp_code:
+            self.status_label.setText('OTP code required')
             self.status_label.setStyleSheet('color: #e94560;')
             return
 
@@ -171,7 +180,7 @@ class ChatBubble(QFrame):
         if timestamp:
             meta_parts.append(timestamp)
         if status:
-            status_icons = {'sent': '✓', 'delivered': '✓✓', 'read': '✓✓'}
+            status_icons = {'sent': '✓', 'delivered': '✓✓', 'read': '✓✓✓'}
             meta_parts.append(status_icons.get(status, status))
         if self_destruct:
             meta_parts.append(f'💣 {self_destruct}s')
@@ -184,7 +193,7 @@ class ChatBubble(QFrame):
 
 
 class ChatWidget(QWidget):
-    def __init__(self, api_client, my_user_id, friend_id, friend_name, session_mgr, message_store, key_bundle):
+    def __init__(self, api_client, my_user_id, friend_id, friend_name, session_mgr, message_store, key_bundle, contact_keys=None):
         super().__init__()
         self.api = api_client
         self.my_user_id = my_user_id
@@ -193,10 +202,12 @@ class ChatWidget(QWidget):
         self.session_mgr = session_mgr
         self.message_store = message_store
         self.key_bundle = key_bundle
+        self.contact_keys = contact_keys
         self._setup_ui()
         self._load_messages()
 
     def _setup_ui(self):
+        from crypto_utils import generate_fingerprint
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -210,10 +221,28 @@ class ChatWidget(QWidget):
         header_layout.addWidget(name_label)
         header_layout.addStretch()
 
+        if self.contact_keys and self.contact_keys.is_verified(self.friend_id):
+            verified_label = QLabel('✓ Verified')
+            verified_label.setStyleSheet('color: #4ecdc4; font-size: 12px; background: transparent;')
+            header_layout.addWidget(verified_label)
+
+        fingerprint_btn = QPushButton('🔑')
+        fingerprint_btn.setFixedSize(32, 32)
+        fingerprint_btn.setStyleSheet('background: transparent; border: none; font-size: 16px;')
+        fingerprint_btn.setToolTip('View fingerprint')
+        fingerprint_btn.clicked.connect(self._show_fingerprint)
+        header_layout.addWidget(fingerprint_btn)
+
         lock_label = QLabel('🔒 E2EE')
         lock_label.setStyleSheet('color: #4ecdc4; font-size: 12px; background: transparent;')
         header_layout.addWidget(lock_label)
         layout.addWidget(header)
+
+        if self.contact_keys and self.contact_keys.has_key_changed(self.friend_id):
+            warning = QLabel('⚠️ Security warning: This contact\'s identity key has changed!')
+            warning.setStyleSheet('background: #e94560; color: white; padding: 8px; font-weight: bold;')
+            warning.setAlignment(Qt.AlignCenter)
+            layout.addWidget(warning)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -269,11 +298,30 @@ class ChatWidget(QWidget):
     def _get_or_create_session(self):
         cipher = self.session_mgr.get_session(self.friend_id)
         if cipher:
+            if self.contact_keys and not self.contact_keys.get_contact(self.friend_id):
+                bundle_data, status = self.api.get_key_bundle(self.friend_id)
+                if status == 200:
+                    ik = bundle_data['identity_public_key']
+                    if ':' in ik:
+                        ik = ik.split(':')[1]
+                    self.contact_keys.save_contact_key(self.friend_id, ik)
             return cipher, None
 
         bundle_data, status = self.api.get_key_bundle(self.friend_id)
         if status != 200:
             raise Exception(f'Failed to get key bundle: {bundle_data.get("error", "Unknown")}')
+
+        if self.contact_keys:
+            ik = bundle_data['identity_public_key']
+            if ':' in ik:
+                ik = ik.split(':')[1]
+            key_changed = self.contact_keys.save_contact_key(self.friend_id, ik)
+            if key_changed:
+                QMessageBox.warning(
+                    self, 'Security Warning',
+                    f'{self.friend_name}\'s identity key has changed!\n'
+                    'This could indicate a security issue or device change.'
+                )
 
         cipher = SessionCipher()
         ephemeral_pub_b64 = cipher.init_sender(self.key_bundle, bundle_data)
@@ -297,12 +345,16 @@ class ChatWidget(QWidget):
         self.send_btn.setEnabled(False)
         try:
             cipher, initial_info = self._get_or_create_session()
-
             self_destruct_seconds = None
             if self.self_destruct_cb.isChecked():
                 self_destruct_seconds = self.destruct_time.value()
 
-            ciphertext, nonce = cipher.encrypt(text)
+            ad = json.dumps({
+                'sender_id': int(self.my_user_id),
+                'receiver_id': int(self.friend_id),
+                'ttl': self_destruct_seconds,
+            }, sort_keys=True)
+            ciphertext, nonce = cipher.encrypt(text, ad)
 
             msg_type = 'initial' if initial_info else 'normal'
             ephemeral_key = initial_info if initial_info else None
@@ -370,13 +422,14 @@ class ChatWidget(QWidget):
                 msg.get('self_destruct_seconds'),
             )
 
-    def receive_message(self, text, timestamp, self_destruct_seconds=None):
+    def receive_message(self, text, timestamp, self_destruct_seconds=None, message_id=None):
         now = time.time()
         msg_data = {
             'sender_id': self.friend_id,
             'text': text,
             'timestamp': timestamp,
             'status': 'delivered',
+            'message_id': message_id,
             'self_destruct_seconds': self_destruct_seconds,
         }
         if self_destruct_seconds:
@@ -384,3 +437,71 @@ class ChatWidget(QWidget):
 
         self.message_store.add_message(self.friend_id, msg_data)
         self._add_bubble(text, False, timestamp, '', self_destruct_seconds)
+
+    def _show_fingerprint(self):
+        from crypto_utils import generate_fingerprint
+        contact = self.contact_keys.get_contact(self.friend_id) if self.contact_keys else None
+        if not contact:
+            QMessageBox.information(self, 'Fingerprint', 'No identity key stored for this contact yet.')
+            return
+
+        fingerprint = generate_fingerprint(contact['identity_key'])
+        verified = contact.get('verified', False)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Contact Fingerprint')
+        dialog.setMinimumWidth(400)
+        layout = QVBoxLayout(dialog)
+
+        layout.addWidget(QLabel(f'<b>{self.friend_name}</b>'))
+        layout.addWidget(QLabel('Identity Key Fingerprint:'))
+
+        fp_label = QLabel(fingerprint)
+        fp_label.setStyleSheet('font-family: monospace; font-size: 14px; padding: 10px; background: #1a1a2e; border-radius: 4px;')
+        fp_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(fp_label)
+
+        status = '✓ Verified' if verified else '✗ Not verified'
+        status_label = QLabel(status)
+        status_label.setStyleSheet(f'color: {"#4ecdc4" if verified else "#e94560"};')
+        layout.addWidget(status_label)
+
+        btn_layout = QHBoxLayout()
+        if not verified:
+            verify_btn = QPushButton('Mark as Verified')
+            verify_btn.clicked.connect(lambda: self._mark_verified(dialog))
+            btn_layout.addWidget(verify_btn)
+        else:
+            unverify_btn = QPushButton('Remove Verification')
+            unverify_btn.clicked.connect(lambda: self._mark_unverified(dialog))
+            btn_layout.addWidget(unverify_btn)
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dialog.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        dialog.exec()
+
+    def _mark_verified(self, dialog):
+        if self.contact_keys:
+            self.contact_keys.mark_verified(self.friend_id, True)
+        dialog.accept()
+        QMessageBox.information(self, 'Verified', f'{self.friend_name} has been marked as verified.')
+
+    def _mark_unverified(self, dialog):
+        if self.contact_keys:
+            self.contact_keys.mark_verified(self.friend_id, False)
+        dialog.accept()
+
+    def refresh_messages(self):
+        while self.messages_layout.count() > 1:
+            item = self.messages_layout.takeAt(0)
+            if item.layout():
+                while item.layout().count():
+                    child = item.layout().takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+            elif item.widget():
+                item.widget().deleteLater()
+        self._load_messages()

@@ -11,12 +11,19 @@ friends_bp = Blueprint('friends', __name__)
 @friends_bp.route('/request', methods=['POST'])
 @jwt_required()
 def send_friend_request():
+    from app import limiter
+    from models import BlockedUser
+    limiter.limit('20 per hour')(lambda: None)()
+
     user_id = int(get_jwt_identity())
     data = request.get_json()
+    if not data:
+        return jsonify({'error': 'Invalid request'}), 400
+
     target_username = data.get('username', '').strip()
 
-    if not target_username:
-        return jsonify({'error': 'Username required'}), 400
+    if not target_username or len(target_username) > 32:
+        return jsonify({'error': 'Invalid username'}), 400
 
     target = User.query.filter_by(username=target_username).first()
     if not target:
@@ -24,6 +31,10 @@ def send_friend_request():
 
     if target.id == user_id:
         return jsonify({'error': 'Cannot add yourself'}), 400
+
+    blocked = BlockedUser.query.filter_by(user_id=target.id, blocked_id=user_id).first()
+    if blocked:
+        return jsonify({'error': 'Cannot send request to this user'}), 403
 
     existing = Friendship.query.filter_by(user_id=user_id, friend_id=target.id).first()
     if existing:
@@ -111,3 +122,56 @@ def list_friends():
             'last_seen': friend.last_seen.isoformat() if friend.last_seen else None,
         })
     return jsonify({'friends': result}), 200
+
+
+@friends_bp.route('/remove', methods=['POST'])
+@jwt_required()
+def remove_friend():
+    user_id = int(get_jwt_identity())
+    data = request.get_json()
+    friend_id = data.get('friend_id')
+
+    if not friend_id:
+        return jsonify({'error': 'friend_id required'}), 400
+
+    Friendship.query.filter_by(user_id=user_id, friend_id=friend_id).delete()
+    Friendship.query.filter_by(user_id=friend_id, friend_id=user_id).delete()
+    db.session.commit()
+    return jsonify({'message': 'Friend removed'}), 200
+
+
+@friends_bp.route('/block', methods=['POST'])
+@jwt_required()
+def block_user():
+    from models import BlockedUser
+    user_id = int(get_jwt_identity())
+    data = request.get_json()
+    target_id = data.get('user_id')
+
+    if not target_id:
+        return jsonify({'error': 'user_id required'}), 400
+
+    existing = BlockedUser.query.filter_by(user_id=user_id, blocked_id=target_id).first()
+    if existing:
+        return jsonify({'error': 'User already blocked'}), 409
+
+    Friendship.query.filter_by(user_id=user_id, friend_id=target_id).delete()
+    Friendship.query.filter_by(user_id=target_id, friend_id=user_id).delete()
+    FriendRequest.query.filter_by(from_user_id=target_id, to_user_id=user_id).delete()
+
+    db.session.add(BlockedUser(user_id=user_id, blocked_id=target_id))
+    db.session.commit()
+    return jsonify({'message': 'User blocked'}), 200
+
+
+@friends_bp.route('/unblock', methods=['POST'])
+@jwt_required()
+def unblock_user():
+    from models import BlockedUser
+    user_id = int(get_jwt_identity())
+    data = request.get_json()
+    target_id = data.get('user_id')
+
+    BlockedUser.query.filter_by(user_id=user_id, blocked_id=target_id).delete()
+    db.session.commit()
+    return jsonify({'message': 'User unblocked'}), 200

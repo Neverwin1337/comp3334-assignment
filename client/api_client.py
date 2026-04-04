@@ -1,12 +1,16 @@
 import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class ApiClient:
-    def __init__(self, base_url='http://localhost:5000'):
+    def __init__(self, base_url='https://localhost:5000', verify_ssl=False):
         self.base_url = base_url
         self.token = None
         self.user_id = None
         self.username = None
+        self.verify_ssl = verify_ssl
 
     def _headers(self):
         h = {'Content-Type': 'application/json'}
@@ -15,11 +19,23 @@ class ApiClient:
         return h
 
     def _get(self, path, params=None):
-        resp = requests.get(f'{self.base_url}{path}', headers=self._headers(), params=params, timeout=10)
+        resp = requests.get(
+            f'{self.base_url}{path}',
+            headers=self._headers(),
+            params=params,
+            timeout=10,
+            verify=self.verify_ssl
+        )
         return resp.json(), resp.status_code
 
     def _post(self, path, data=None):
-        resp = requests.post(f'{self.base_url}{path}', headers=self._headers(), json=data, timeout=10)
+        resp = requests.post(
+            f'{self.base_url}{path}',
+            headers=self._headers(),
+            json=data,
+            timeout=10,
+            verify=self.verify_ssl
+        )
         return resp.json(), resp.status_code
 
     def register(self, username, password):
@@ -98,3 +114,15 @@ class ApiClient:
 
     def download_backup(self):
         return self._get('/api/keys/backup')
+
+    def get_sent_status(self):
+        return self._get('/api/messages/sent_status')
+
+    def remove_friend(self, friend_id):
+        return self._post('/api/friends/remove', {'friend_id': friend_id})
+
+    def block_user(self, user_id):
+        return self._post('/api/friends/block', {'user_id': user_id})
+
+    def unblock_user(self, user_id):
+        return self._post('/api/friends/unblock', {'user_id': user_id})
