@@ -396,7 +396,9 @@ class MainWindow(QMainWindow):
             sender_ik = info['sender_ik']
             if ':' in sender_ik:
                 sender_ik = sender_ik.split(':')[1]
-            self.contact_keys.save_contact_key(sender_id, sender_ik)
+            key_changed = self.contact_keys.save_contact_key(sender_id, sender_ik)
+            if key_changed:
+                self._show_key_change_warning(sender_id)
             return cipher.decrypt(msg['ciphertext'], msg['nonce'], ad)
         else:
             cipher = self.session_mgr.get_session(sender_id)
@@ -409,10 +411,28 @@ class MainWindow(QMainWindow):
                         ik = bundle_data['identity_public_key']
                         if ':' in ik:
                             ik = ik.split(':')[1]
-                        self.contact_keys.save_contact_key(sender_id, ik)
+                        key_changed = self.contact_keys.save_contact_key(sender_id, ik)
+                        if key_changed:
+                            self._show_key_change_warning(sender_id)
                 except Exception:
                     pass
             return cipher.decrypt(msg['ciphertext'], msg['nonce'], ad)
+
+    def _show_key_change_warning(self, user_id):
+        friend_name = f'User {user_id}'
+        for f in getattr(self, '_friends_data', []):
+            if f.get('id') == user_id:
+                friend_name = f.get('username', friend_name)
+                break
+        QMessageBox.warning(
+            self, 'Security Warning',
+            f'{friend_name}\'s identity key has changed!\n\n'
+            'This could indicate:\n'
+            '• The contact reinstalled the app\n'
+            '• The contact is using a new device\n'
+            '• A potential security threat (man-in-the-middle attack)\n\n'
+            'Please verify this change with your contact through another channel.'
+        )
 
     def _on_new_friend_requests(self, requests):
         self._update_requests_list(requests)

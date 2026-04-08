@@ -298,13 +298,23 @@ class ChatWidget(QWidget):
     def _get_or_create_session(self):
         cipher = self.session_mgr.get_session(self.friend_id)
         if cipher:
-            if self.contact_keys and not self.contact_keys.get_contact(self.friend_id):
+            if self.contact_keys:
                 bundle_data, status = self.api.get_key_bundle(self.friend_id)
                 if status == 200:
                     ik = bundle_data['identity_public_key']
                     if ':' in ik:
                         ik = ik.split(':')[1]
-                    self.contact_keys.save_contact_key(self.friend_id, ik)
+                    key_changed = self.contact_keys.save_contact_key(self.friend_id, ik)
+                    if key_changed:
+                        QMessageBox.warning(
+                            self, 'Security Warning',
+                            f'{self.friend_name}\'s identity key has changed!\n\n'
+                            'This could indicate:\n'
+                            '• The contact reinstalled the app\n'
+                            '• The contact is using a new device\n'
+                            '• A potential security threat\n\n'
+                            'Please verify with your contact.'
+                        )
             return cipher, None
 
         bundle_data, status = self.api.get_key_bundle(self.friend_id)
