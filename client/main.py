@@ -325,7 +325,13 @@ class MainWindow(QMainWindow):
         ack_ids = []
         for msg in messages:
             msg_id = msg['message_id']
+            ciphertext = msg.get('ciphertext', '')
+
             if self.message_store.is_duplicate(msg_id):
+                ack_ids.append(msg_id)
+                continue
+
+            if self.message_store.is_duplicate_ciphertext(ciphertext):
                 ack_ids.append(msg_id)
                 continue
 
@@ -335,7 +341,7 @@ class MainWindow(QMainWindow):
                 ts = datetime.fromisoformat(msg['created_at']).strftime('%H:%M')
                 sd = msg.get('self_destruct_seconds')
 
-                self.message_store.mark_seen(msg_id)
+                self.message_store.mark_seen(msg_id, ciphertext)
 
                 if sender_id in self.chat_widgets:
                     self.chat_widgets[sender_id].receive_message(plaintext, ts, sd, msg_id)

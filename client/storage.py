@@ -54,6 +54,12 @@ def init_db(username):
         )
     ''')
 
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS seen_ciphertexts (
+            ciphertext_hash TEXT PRIMARY KEY
+        )
+    ''')
+
     conn.commit()
     conn.close()
 
@@ -205,13 +211,30 @@ class MessageStore:
         conn.close()
         return result
 
-    def mark_seen(self, message_id):
-        if message_id is None:
-            return
+    def is_duplicate_ciphertext(self, ciphertext):
+        if not ciphertext:
+            return False
+        import hashlib
+        ct_hash = hashlib.sha256(ciphertext.encode('utf-8')).hexdigest()
         conn = self._conn()
         c = conn.cursor()
-        c.execute('INSERT OR IGNORE INTO seen_messages (message_id) VALUES (?)', (int(message_id),))
-        c.execute('DELETE FROM seen_messages WHERE message_id NOT IN (SELECT message_id FROM seen_messages ORDER BY message_id DESC LIMIT 10000)')
+        c.execute('SELECT 1 FROM seen_ciphertexts WHERE ciphertext_hash = ?', (ct_hash,))
+        result = c.fetchone() is not None
+        conn.close()
+        return result
+
+    def mark_seen(self, message_id, ciphertext=None):
+        conn = self._conn()
+        c = conn.cursor()
+        if message_id is not None:
+            c.execute('INSERT OR IGNORE INTO seen_messages (message_id) VALUES (?)', (int(message_id),))
+            c.execute('DELETE FROM seen_messages WHERE message_id NOT IN (SELECT message_id FROM seen_messages ORDER BY message_id DESC LIMIT 10000)')
+        if ciphertext:
+            import hashlib
+            ct_hash = hashlib.sha256(ciphertext.encode('utf-8')).hexdigest()
+            c.execute('INSERT OR IGNORE INTO seen_ciphertexts (ciphertext_hash) VALUES (?)', (ct_hash,))
+            c.execute('''DELETE FROM seen_ciphertexts WHERE rowid NOT IN 
+                        (SELECT rowid FROM seen_ciphertexts ORDER BY rowid DESC LIMIT 10000)''')
         conn.commit()
         conn.close()
 
